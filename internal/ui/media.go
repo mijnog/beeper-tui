@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"image"
 	"mime"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -136,8 +138,17 @@ func (m Model) openCursorAttachment() (Model, tea.Cmd) {
 		if err != nil {
 			return openResultMsg{err: err}
 		}
-		return openResultMsg{err: exec.Command("open", openablePath(path, att)).Start()}
+		return openResultMsg{err: exec.Command(openCommand(), openablePath(path, att)).Start()}
 	}
+}
+
+// openCommand is the OS default-app launcher: `open` on macOS, `xdg-open`
+// elsewhere (Linux desktops).
+func openCommand() string {
+	if runtime.GOOS == "darwin" {
+		return "open"
+	}
+	return "xdg-open"
 }
 
 // openablePath gives a downloaded asset a file extension when the cache path
@@ -188,6 +199,9 @@ type clipboardImageMsg struct {
 // screenshot or copied image lands as PNG data; a file copied in Finder lands
 // as a file reference, which resolves to its original path.
 func pasteClipboardImageCmd() tea.Cmd {
+	if runtime.GOOS != "darwin" {
+		return pasteClipboardImageLinuxCmd()
+	}
 	return func() tea.Msg {
 		path := filepath.Join(os.TempDir(), fmt.Sprintf("beeper-tui-paste-%d.png", time.Now().UnixNano()))
 		script := fmt.Sprintf(`set f to open for access POSIX file %q with write permission
@@ -208,6 +222,36 @@ close access f`, path)
 			return clipboardImageMsg{err: fmt.Errorf("clipboard file is not an image or video")}
 		}
 		return clipboardImageMsg{path: p}
+	}
+}
+
+// pasteClipboardImageLinuxCmd is the Wayland counterpart, using wl-paste
+// (package wl-clipboard). An image on the clipboard is written out as PNG; a
+// file copied in a file manager arrives as a text/uri-list file:// URL.
+func pasteClipboardImageLinuxCmd() tea.Cmd {
+	return func() tea.Msg {
+		if _, err := exec.LookPath("wl-paste"); err != nil {
+			return clipboardImageMsg{err: fmt.Errorf("wl-paste not found; install wl-clipboard")}
+		}
+		path := filepath.Join(os.TempDir(), fmt.Sprintf("beeper-tui-paste-%d.png", time.Now().UnixNano()))
+		if data, err := exec.Command("wl-paste", "--no-newline", "--type", "image/png").Output(); err == nil && len(data) > 0 {
+			if err := os.WriteFile(path, data, 0o600); err == nil {
+				return clipboardImageMsg{path: path}
+			}
+		}
+		out, err := exec.Command("wl-paste", "--no-newline", "--type", "text/uri-list").Output()
+		if err != nil {
+			return clipboardImageMsg{err: fmt.Errorf("no image on clipboard")}
+		}
+		first := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+		u, err := url.Parse(first)
+		if err != nil || u.Scheme != "file" {
+			return clipboardImageMsg{err: fmt.Errorf("no image on clipboard")}
+		}
+		if !isMediaFile(u.Path) {
+			return clipboardImageMsg{err: fmt.Errorf("clipboard file is not an image or video")}
+		}
+		return clipboardImageMsg{path: u.Path}
 	}
 }
 
